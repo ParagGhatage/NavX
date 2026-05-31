@@ -22,13 +22,31 @@ class TrackingService : Service() {
     private val TAG = "NavX_Tracker"
     private val CHANNEL_ID = "tracking_channel"
 
-    // The hardware manager and our listener
+    // Hardware and Database managers
     private lateinit var locationManager: LocationManager
+    private lateinit var database: AppDatabase
 
     private val locationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
-            // WE HAVE DATA! Print the raw latitude, longitude, and altitude to the terminal.
-            Log.i(TAG, "HARDWARE GPS: Lat: ${location.latitude} | Lon: ${location.longitude} | Alt: ${location.altitude}m")
+            // 1. We got a ping from the hardware
+            Log.i(TAG, "HARDWARE GPS: Lat: ${location.latitude} | Lon: ${location.longitude}")
+
+            // 2. Map it to our SQLite Entity
+            val locationData = LocationEntity(
+                latitude = location.latitude,
+                longitude = location.longitude,
+                altitude = location.altitude,
+                // location.time returns the actual satellite atomic clock time in milliseconds
+                timestamp = location.time
+            )
+
+            // 3. Save it permanently to the local database
+            try {
+                database.locationDao().insertLocation(locationData)
+                Log.i(TAG, "SUCCESS: Coordinate saved to offline SQLite database.")
+            } catch (e: Exception) {
+                Log.e(TAG, "DATABASE ERROR: Failed to save coordinate: ${e.message}")
+            }
         }
 
         override fun onProviderEnabled(provider: String) {
@@ -44,8 +62,12 @@ class TrackingService : Service() {
         super.onCreate()
         Log.d(TAG, "Service Created")
         createNotificationChannel()
-        // Initialize the manager
+
+        // Initialize the Location hardware manager
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+
+        // Initialize the Room SQLite database
+        database = AppDatabase.getDatabase(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -53,30 +75,25 @@ class TrackingService : Service() {
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("NavX Active Tracking")
-            .setContentText("Hardware GPS is listening...")
+            .setContentText("Recording route to offline database...")
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setOngoing(true)
             .build()
 
         startForeground(1, notification)
-
-        // Turn on the GPS chip
         startLocationTracking()
 
         return START_STICKY
     }
 
     private fun startLocationTracking() {
-        // Double-check permissions right before touching the hardware (Android requires this)
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
             Log.i(TAG, "Powering on GPS receiver...")
             try {
-                // Request updates from the physical GPS chip.
-                // Params: Provider, Min Time (ms), Min Distance (meters), Listener
                 locationManager.requestLocationUpdates(
                     LocationManager.GPS_PROVIDER,
-                    5000L, // 5 seconds
-                    0f,    // 0 meters (update even if standing still for testing)
+                    5000L, // Poll every 5 seconds
+                    0f,
                     locationListener
                 )
             } catch (e: Exception) {
@@ -90,7 +107,6 @@ class TrackingService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Log.d(TAG, "Service Destroyed. Powering down GPS.")
-        // CRITICAL: Stop listening when service dies to save battery
         if (::locationManager.isInitialized) {
             locationManager.removeUpdates(locationListener)
         }
