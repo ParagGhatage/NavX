@@ -1,2 +1,0 @@
-# NavX
-Offline Navigation anywhere.
