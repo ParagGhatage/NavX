@@ -5,10 +5,11 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 
-@Database(entities = [LocationEntity::class], version = 2, exportSchema = false)
+@Database(entities = [LocationEntity::class, RouteEntity::class], version = 3, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
 
     abstract fun locationDao(): LocationDao
+    abstract fun routeDao(): RouteDao
 
     companion object {
         @Volatile
@@ -21,8 +22,8 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "navx_offline_database"
                 )
-                    // Allows us to write to the DB on the service's background thread
                     .allowMainThreadQueries()
+                    .fallbackToDestructiveMigration()
                     .build()
                 INSTANCE = instance
                 instance

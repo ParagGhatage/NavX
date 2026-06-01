@@ -99,29 +99,124 @@ class MainActivity : ComponentActivity() {
 fun MapLibreScreen(database: AppDatabase) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val coroutineScope = rememberCoroutineScope() // Scope for DB calls on button clicks
+    val coroutineScope = rememberCoroutineScope()
 
     var mapLibreMap by remember { mutableStateOf<MapLibreMap?>(null) }
     val mapView = remember { MapView(context) }
 
     var liveLat by remember { mutableStateOf<Double?>(null) }
     var liveLng by remember { mutableStateOf<Double?>(null) }
-    var isTrackingActive by remember { mutableStateOf(false) }
+    var isRecording by remember { mutableStateOf(false) }
+    var currentRouteId by remember { mutableStateOf<Int?>(null) }
+    var isLocationEnabled by remember { mutableStateOf(true) }
 
-    // --- THE 1-SECOND POLLING LOOP (FIXED) ---
+    val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+
+    fun getGPSLocation(callback: (latitude: Double, longitude: Double) -> Unit) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            return
+        }
+
+        if (!locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+            Toast.makeText(context, "GPS is off. Enable Location in settings.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            locationManager.getCurrentLocation(LocationManager.GPS_PROVIDER, null, context.mainExecutor) { location: Location? ->
+                if (location != null) {
+                    android.util.Log.d("NavX", "Got FRESH GPS location: ${location.latitude}, ${location.longitude}")
+                    callback(location.latitude, location.longitude)
+                } else {
+                    Toast.makeText(context, "Cannot get GPS lock. Are you indoors?", Toast.LENGTH_LONG).show()
+                }
+            }
+        } else {
+            val lastKnown = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+            if (lastKnown != null) {
+                android.util.Log.d("NavX", "Got LAST KNOWN GPS location: ${lastKnown.latitude}, ${lastKnown.longitude}")
+                callback(lastKnown.latitude, lastKnown.longitude)
+            }
+        }
+    }
+
+    fun centerMapOnLocation(latitude: Double, longitude: Double) {
+        val currentLatLng = LatLng(latitude, longitude)
+        val position = CameraPosition.Builder().target(currentLatLng).zoom(16.0).tilt(0.0).build()
+        mapLibreMap?.animateCamera(CameraUpdateFactory.newCameraPosition(position), 1500)
+
+        // Add marker for current location
+        mapLibreMap?.addMarker(MarkerOptions().position(currentLatLng).title("My Location"))
+    }
+
+    // Delete all routes, start GPS tracking on app open
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            // Delete all routes and locations
+            database.locationDao().deleteAll()
+            val allRoutes = database.routeDao().getAllRoutes()
+            allRoutes.forEach { database.routeDao().deleteRoute(it.id) }
+
+            // Create new route for this session
+            val newRoute = RouteEntity(startTime = System.currentTimeMillis())
+            val routeId = database.routeDao().insertRoute(newRoute).toInt()
+            currentRouteId = routeId
+            android.util.Log.d("NavX", "New route created: $routeId")
+        }
+
+        // Get initial GPS location immediately
+        delay(500)
+        getGPSLocation { lat, lng ->
+            liveLat = lat
+            liveLng = lng
+            centerMapOnLocation(lat, lng)
+            Toast.makeText(context, "GPS lock acquired", Toast.LENGTH_SHORT).show()
+        }
+
+        // Start GPS tracking service for continuous updates
+        delay(1000)
+        val intent = Intent(context, TrackingService::class.java)
+        intent.putExtra("routeId", currentRouteId)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+        Toast.makeText(context, "GPS tracking started", Toast.LENGTH_SHORT).show()
+    }
+
+    // Poll database for latest GPS coordinates (for continuous updates from service)
+    LaunchedEffect(currentRouteId) {
+        while (true) {
+            delay(1000)
+            if (currentRouteId != null) {
+                val latestLocation = withContext(Dispatchers.IO) {
+                    database.locationDao().getLocationsByRoute(currentRouteId ?: -1).lastOrNull()
+                }
+
+                if (latestLocation != null) {
+                    android.util.Log.d("NavX", "Got location from SERVICE: ${latestLocation.latitude}, ${latestLocation.longitude}")
+                    liveLat = latestLocation.latitude
+                    liveLng = latestLocation.longitude
+                }
+            }
+        }
+    }
+
+    // Location status monitoring
     LaunchedEffect(Unit) {
         while (true) {
-            // Move the database work to the IO thread
-            val latestLocation = withContext(Dispatchers.IO) {
-                database.locationDao().getAllLocations().lastOrNull()
+            val wasEnabled = isLocationEnabled
+            isLocationEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+
+            if (wasEnabled && !isLocationEnabled && isRecording) {
+                isRecording = false
+                val intent = Intent(context, TrackingService::class.java)
+                context.stopService(intent)
+                Toast.makeText(context, "GPS disabled. Recording stopped.", Toast.LENGTH_LONG).show()
             }
 
-            // Update UI state on the Main thread
-            if (latestLocation != null) {
-                liveLat = latestLocation.latitude
-                liveLng = latestLocation.longitude
-            }
-            delay(1000)
+            delay(5000)
         }
     }
 
@@ -153,7 +248,16 @@ fun MapLibreScreen(database: AppDatabase) {
                             isRotateGesturesEnabled = true
                             isTiltGesturesEnabled = false
                         }
-                        map.setStyle("asset://offline-style.json")
+
+                        val defaultPosition = CameraPosition.Builder()
+                            .target(LatLng(0.0, 0.0))
+                            .zoom(2.0)
+                            .build()
+                        map.cameraPosition = defaultPosition
+
+                        map.setStyle("https://demotiles.maplibre.org/style.json") { style ->
+                            android.util.Log.d("NavX", "Map style loaded")
+                        }
                     }
                 }
             },
@@ -176,10 +280,10 @@ fun MapLibreScreen(database: AppDatabase) {
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = if (isTrackingActive) "● RECORDING ROUTE" else "GPS TELEMETRY (IDLE)",
+                    text = if (isRecording) "● RECORDING ROUTE" else "GPS TELEMETRY (IDLE)",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
-                    color = if (isTrackingActive) Color.Red else MaterialTheme.colorScheme.primary,
+                    color = if (isRecording) Color.Red else MaterialTheme.colorScheme.primary,
                     letterSpacing = 1.5.sp
                 )
                 Spacer(modifier = Modifier.height(6.dp))
@@ -209,91 +313,80 @@ fun MapLibreScreen(database: AppDatabase) {
             }
         }
 
-        // Action Buttons
+        // Toggle Button
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = 32.dp),
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
+            horizontalArrangement = Arrangement.Center
         ) {
             Button(
                 onClick = {
-                    coroutineScope.launch(Dispatchers.IO) {
-                        database.locationDao().deleteAll() // ← wipe old session
-                    }
-                    val intent = Intent(context, TrackingService::class.java)
-
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        context.startForegroundService(intent)
+                    if (!isRecording) {
+                        // Mark as recording (service already running)
+                        isRecording = true
+                        Toast.makeText(context, "Route recording started", Toast.LENGTH_SHORT).show()
                     } else {
-                        context.startService(intent)
-                    }
-                    isTrackingActive = true
-                    // Clear the map of old routes before a new recording
-                    mapLibreMap?.clear()
-                    Toast.makeText(context, "Recording 5-sec GPS intervals", Toast.LENGTH_SHORT).show()
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))
-            ) {
-                Text("Record")
-            }
+                        // Stop recording
+                        val intent = Intent(context, TrackingService::class.java)
+                        context.stopService(intent)
+                        isRecording = false
+                        Toast.makeText(context, "Recording stopped.", Toast.LENGTH_SHORT).show()
 
-            Button(
-                onClick = {
-                    // 1. Kill the hardware service
-                    val intent = Intent(context, TrackingService::class.java)
-                    context.stopService(intent)
-                    isTrackingActive = false
-                    Toast.makeText(context, "Stopped. Plotting route...", Toast.LENGTH_SHORT).show()
+                        // Update route with end time and draw it
+                        currentRouteId?.let { routeId ->
+                            coroutineScope.launch(Dispatchers.IO) {
+                                database.routeDao().getRouteById(routeId)?.let { route ->
+                                    val updatedRoute = route.copy(endTime = System.currentTimeMillis(), isActive = false)
+                                    database.routeDao().updateRoute(updatedRoute)
 
-                    // 2. Query SQLite and draw the Polyline
-                    coroutineScope.launch(Dispatchers.IO) {
-                        val allLocations = database.locationDao().getAllLocations()
+                                    // Draw the current route
+                                    val locations = database.locationDao().getLocationsByRoute(routeId)
+                                    if (locations.size >= 2) {
+                                        withContext(Dispatchers.Main) {
+                                            mapLibreMap?.style?.let { style ->
+                                                val points = locations.map { Point.fromLngLat(it.longitude, it.latitude) }
+                                                val lineString = LineString.fromLngLats(points)
+                                                val feature = Feature.fromGeometry(lineString)
 
-                        if (allLocations.size >= 2) {
-                            // Convert Room Entities to GeoJSON Points (MUST BE Longitude, Latitude)
-                            val points = allLocations.map { Point.fromLngLat(it.longitude, it.latitude) }
-                            val lineString = LineString.fromLngLats(points)
-                            val feature = Feature.fromGeometry(lineString)
+                                                var source = style.getSourceAs<GeoJsonSource>("current-route-source")
+                                                if (source == null) {
+                                                    source = GeoJsonSource("current-route-source")
+                                                    style.addSource(source)
+                                                }
+                                                source.setGeoJson(feature)
 
-                            withContext(Dispatchers.Main) {
-                                mapLibreMap?.style?.let { style ->
+                                                if (style.getLayer("current-route-layer") == null) {
+                                                    val lineLayer = LineLayer("current-route-layer", "current-route-source")
+                                                        .withProperties(
+                                                            PropertyFactory.lineColor(android.graphics.Color.RED),
+                                                            PropertyFactory.lineWidth(5f),
+                                                            PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                                                            PropertyFactory.lineCap(Property.LINE_CAP_ROUND)
+                                                        )
+                                                    style.addLayer(lineLayer)
+                                                }
 
-                                    // Inject the vector data
-                                    var source = style.getSourceAs<GeoJsonSource>("route-source")
-                                    if (source == null) {
-                                        source = GeoJsonSource("route-source")
-                                        style.addSource(source)
+                                                mapLibreMap?.addMarker(MarkerOptions().position(LatLng(locations.first().latitude, locations.first().longitude)).title("Start"))
+                                                mapLibreMap?.addMarker(MarkerOptions().position(LatLng(locations.last().latitude, locations.last().longitude)).title("Finish"))
+                                            }
+                                        }
                                     }
-                                    source.setGeoJson(feature)
-
-                                    // Paint the vector data red
-                                    if (style.getLayer("route-layer") == null) {
-                                        val lineLayer = LineLayer("route-layer", "route-source")
-                                            .withProperties(
-                                                PropertyFactory.lineColor(android.graphics.Color.parseColor("#FF0000")),
-                                                PropertyFactory.lineWidth(5f),
-                                                PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-                                                PropertyFactory.lineCap(Property.LINE_CAP_ROUND)
-                                            )
-                                        style.addLayer(lineLayer)
-                                    }
-
-                                    // Drop start and end pins
-                                    mapLibreMap?.addMarker(MarkerOptions().position(LatLng(allLocations.first().latitude, allLocations.first().longitude)).title("Start"))
-                                    mapLibreMap?.addMarker(MarkerOptions().position(LatLng(allLocations.last().latitude, allLocations.last().longitude)).title("Finish"))
                                 }
-                            }
-                        } else {
-                            withContext(Dispatchers.Main) {
-                                Toast.makeText(context, "Not enough points to draw a route.", Toast.LENGTH_LONG).show()
                             }
                         }
                     }
                 },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828))
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (isRecording) Color(0xFFC62828) else Color(0xFF2E7D32)
+                ),
+                modifier = Modifier.size(width = 180.dp, height = 50.dp)
             ) {
-                Text("Stop")
+                Text(
+                    text = if (isRecording) "STOP" else "START",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold
+                )
             }
         }
 
@@ -317,39 +410,10 @@ fun MapLibreScreen(database: AppDatabase) {
             }
 
             MapControlFAB(icon = Icons.Default.LocationOn, contentDescription = "Locate Me") {
-                val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
-
-                if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                    val isGpsEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
-
-                    if (!isGpsEnabled) {
-                        Toast.makeText(context, "GPS is off. Enable Location in settings.", Toast.LENGTH_LONG).show()
-                    } else {
-                        Toast.makeText(context, "Pinging satellites...", Toast.LENGTH_SHORT).show()
-
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                            locationManager.getCurrentLocation(
-                                LocationManager.GPS_PROVIDER,
-                                null,
-                                context.mainExecutor
-                            ) { location: Location? ->
-                                if (location != null) {
-                                    val currentLatLng = LatLng(location.latitude, location.longitude)
-                                    val position = CameraPosition.Builder().target(currentLatLng).zoom(16.0).tilt(0.0).build()
-                                    mapLibreMap?.animateCamera(CameraUpdateFactory.newCameraPosition(position), 1500)
-                                } else {
-                                    Toast.makeText(context, "Cannot get lock. Are you indoors?", Toast.LENGTH_LONG).show()
-                                }
-                            }
-                        } else {
-                            val lastKnown = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                            if (lastKnown != null) {
-                                val currentLatLng = LatLng(lastKnown.latitude, lastKnown.longitude)
-                                val position = CameraPosition.Builder().target(currentLatLng).zoom(16.0).tilt(0.0).build()
-                                mapLibreMap?.animateCamera(CameraUpdateFactory.newCameraPosition(position), 1500)
-                            }
-                        }
-                    }
+                getGPSLocation { lat, lng ->
+                    liveLat = lat
+                    liveLng = lng
+                    centerMapOnLocation(lat, lng)
                 }
             }
         }

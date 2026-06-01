@@ -21,6 +21,7 @@ class TrackingService : Service() {
     private lateinit var database: AppDatabase
     private var wakeLock: PowerManager.WakeLock? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO)
+    private var currentRouteId: Int? = null
 
     @SuppressLint("WakelockTimeout")
     override fun onCreate() {
@@ -44,6 +45,11 @@ class TrackingService : Service() {
         } catch (e: SecurityException) { /* Handle missing permissions */ }
     }
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        currentRouteId = intent?.getIntExtra("routeId", -1)?.takeIf { it != -1 }
+        return super.onStartCommand(intent, flags, startId)
+    }
+
     private val locationListener = LocationListener { location ->
         // Ignore fixes worse than 20 meters accuracy
         if (location.accuracy > 20f) return@LocationListener
@@ -54,7 +60,8 @@ class TrackingService : Service() {
                     latitude = location.latitude,
                     longitude = location.longitude,
                     altitude = location.altitude,
-                    timestamp = System.currentTimeMillis()
+                    timestamp = System.currentTimeMillis(),
+                    routeId = currentRouteId
                 )
             )
         }
