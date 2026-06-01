@@ -41,7 +41,8 @@ android {
 }
 
 dependencies {
-
+    implementation(libs.androidx.compose.material.icons.extended)
+    implementation(libs.maplibre.android)
     implementation(libs.room.runtime)
     implementation(libs.room.ktx)
     ksp(libs.room.compiler)

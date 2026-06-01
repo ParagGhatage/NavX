@@ -10,8 +10,12 @@ kotlin = "2.2.10"
 ksp = "2.2.10-2.0.2"
 composeBom = "2026.02.01"
 room = "2.8.4"
+maplibre = "11.5.2"
+
 
 [libraries]
+androidx-compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
+maplibre-android = { group = "org.maplibre.gl", name = "android-sdk", version.ref = "maplibre" }
 room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
 room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
 room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
