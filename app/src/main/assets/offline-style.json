@@ -1,0 +1,14 @@
+{
+  "version": 8,
+  "name": "NavX Basic Offline Style",
+  "sources": {},
+  "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": {
+        "background-color": "#e0e0e0"
+      }
+    }
+  ]
+}

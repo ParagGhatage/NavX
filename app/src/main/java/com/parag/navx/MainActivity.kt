@@ -35,7 +35,10 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.maplibre.android.MapLibre
 import org.maplibre.android.annotations.MarkerOptions
 import org.maplibre.android.camera.CameraPosition
@@ -43,12 +46,18 @@ import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.MapLibreMap
+import org.maplibre.android.style.layers.LineLayer
+import org.maplibre.android.style.layers.Property
+import org.maplibre.android.style.layers.PropertyFactory
+import org.maplibre.android.style.sources.GeoJsonSource
+import org.maplibre.geojson.Feature
+import org.maplibre.geojson.LineString
+import org.maplibre.geojson.Point
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var database: AppDatabase
 
-    // Permission Memory Handler
     private val requestPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -61,16 +70,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. Core Engine Init
         MapLibre.getInstance(this)
         database = AppDatabase.getDatabase(this)
 
-        // 2. Strict Hardware & Background Permission Checks
         val permissionsToRequest = mutableListOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION
         )
-        // Explicitly request Notification access for Foreground Service on Android 13+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -93,28 +99,32 @@ class MainActivity : ComponentActivity() {
 fun MapLibreScreen(database: AppDatabase) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val coroutineScope = rememberCoroutineScope() // Scope for DB calls on button clicks
 
     var mapLibreMap by remember { mutableStateOf<MapLibreMap?>(null) }
     val mapView = remember { MapView(context) }
 
-    // Live Telemetry State
     var liveLat by remember { mutableStateOf<Double?>(null) }
     var liveLng by remember { mutableStateOf<Double?>(null) }
     var isTrackingActive by remember { mutableStateOf(false) }
 
-    // --- THE 1-SECOND POLLING LOOP ---
+    // --- THE 1-SECOND POLLING LOOP (FIXED) ---
     LaunchedEffect(Unit) {
         while (true) {
-            val latestLocation = database.locationDao().getAllLocations().lastOrNull()
+            // Move the database work to the IO thread
+            val latestLocation = withContext(Dispatchers.IO) {
+                database.locationDao().getAllLocations().lastOrNull()
+            }
+
+            // Update UI state on the Main thread
             if (latestLocation != null) {
                 liveLat = latestLocation.latitude
                 liveLng = latestLocation.longitude
             }
-            delay(1000) // Poll SQLite every 1000ms
+            delay(1000)
         }
     }
 
-    // MapView GL Lifecycle binding
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -132,7 +142,6 @@ fun MapLibreScreen(database: AppDatabase) {
 
     Box(modifier = Modifier.fillMaxSize()) {
 
-        // 1. OpenGL Map Engine (Totally Offline)
         AndroidView(
             factory = {
                 mapView.apply {
@@ -144,7 +153,6 @@ fun MapLibreScreen(database: AppDatabase) {
                             isRotateGesturesEnabled = true
                             isTiltGesturesEnabled = false
                         }
-                        // Explicitly reading your local assets folder!
                         map.setStyle("asset://offline-style.json")
                     }
                 }
@@ -152,7 +160,6 @@ fun MapLibreScreen(database: AppDatabase) {
             modifier = Modifier.fillMaxSize()
         )
 
-        // 2. Telemetry Status Card
         Card(
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -169,7 +176,7 @@ fun MapLibreScreen(database: AppDatabase) {
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = if (isTrackingActive) "● LIVE GPS TELEMETRY" else "GPS TELEMETRY (IDLE)",
+                    text = if (isTrackingActive) "● RECORDING ROUTE" else "GPS TELEMETRY (IDLE)",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     color = if (isTrackingActive) Color.Red else MaterialTheme.colorScheme.primary,
@@ -202,7 +209,7 @@ fun MapLibreScreen(database: AppDatabase) {
             }
         }
 
-        // 3. Background Service Controls
+        // Action Buttons
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -211,34 +218,86 @@ fun MapLibreScreen(database: AppDatabase) {
         ) {
             Button(
                 onClick = {
+                    coroutineScope.launch(Dispatchers.IO) {
+                        database.locationDao().deleteAll() // ← wipe old session
+                    }
                     val intent = Intent(context, TrackingService::class.java)
+
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         context.startForegroundService(intent)
                     } else {
                         context.startService(intent)
                     }
                     isTrackingActive = true
-                    Toast.makeText(context, "Hardware Tracking Started", Toast.LENGTH_SHORT).show()
+                    // Clear the map of old routes before a new recording
+                    mapLibreMap?.clear()
+                    Toast.makeText(context, "Recording 5-sec GPS intervals", Toast.LENGTH_SHORT).show()
                 },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)) // Dark Green
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))
             ) {
-                Text("Start Service")
+                Text("Record")
             }
 
             Button(
                 onClick = {
+                    // 1. Kill the hardware service
                     val intent = Intent(context, TrackingService::class.java)
                     context.stopService(intent)
                     isTrackingActive = false
-                    Toast.makeText(context, "Hardware Tracking Stopped", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Stopped. Plotting route...", Toast.LENGTH_SHORT).show()
+
+                    // 2. Query SQLite and draw the Polyline
+                    coroutineScope.launch(Dispatchers.IO) {
+                        val allLocations = database.locationDao().getAllLocations()
+
+                        if (allLocations.size >= 2) {
+                            // Convert Room Entities to GeoJSON Points (MUST BE Longitude, Latitude)
+                            val points = allLocations.map { Point.fromLngLat(it.longitude, it.latitude) }
+                            val lineString = LineString.fromLngLats(points)
+                            val feature = Feature.fromGeometry(lineString)
+
+                            withContext(Dispatchers.Main) {
+                                mapLibreMap?.style?.let { style ->
+
+                                    // Inject the vector data
+                                    var source = style.getSourceAs<GeoJsonSource>("route-source")
+                                    if (source == null) {
+                                        source = GeoJsonSource("route-source")
+                                        style.addSource(source)
+                                    }
+                                    source.setGeoJson(feature)
+
+                                    // Paint the vector data red
+                                    if (style.getLayer("route-layer") == null) {
+                                        val lineLayer = LineLayer("route-layer", "route-source")
+                                            .withProperties(
+                                                PropertyFactory.lineColor(android.graphics.Color.parseColor("#FF0000")),
+                                                PropertyFactory.lineWidth(5f),
+                                                PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                                                PropertyFactory.lineCap(Property.LINE_CAP_ROUND)
+                                            )
+                                        style.addLayer(lineLayer)
+                                    }
+
+                                    // Drop start and end pins
+                                    mapLibreMap?.addMarker(MarkerOptions().position(LatLng(allLocations.first().latitude, allLocations.first().longitude)).title("Start"))
+                                    mapLibreMap?.addMarker(MarkerOptions().position(LatLng(allLocations.last().latitude, allLocations.last().longitude)).title("Finish"))
+                                }
+                            }
+                        } else {
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(context, "Not enough points to draw a route.", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
                 },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828)) // Dark Red
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828))
             ) {
-                Text("Stop Service")
+                Text("Stop")
             }
         }
 
-        // 4. Map Control & Manual Ping
+        // Map Control Stack
         Column(
             modifier = Modifier
                 .align(Alignment.CenterEnd)
@@ -257,7 +316,6 @@ fun MapLibreScreen(database: AppDatabase) {
                 }
             }
 
-            // Manual Location Ping (The Verifier)
             MapControlFAB(icon = Icons.Default.LocationOn, contentDescription = "Locate Me") {
                 val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
 
@@ -277,8 +335,6 @@ fun MapLibreScreen(database: AppDatabase) {
                             ) { location: Location? ->
                                 if (location != null) {
                                     val currentLatLng = LatLng(location.latitude, location.longitude)
-                                    mapLibreMap?.clear()
-                                    mapLibreMap?.addMarker(MarkerOptions().position(currentLatLng).title("Hardware Lock"))
                                     val position = CameraPosition.Builder().target(currentLatLng).zoom(16.0).tilt(0.0).build()
                                     mapLibreMap?.animateCamera(CameraUpdateFactory.newCameraPosition(position), 1500)
                                 } else {
@@ -289,12 +345,8 @@ fun MapLibreScreen(database: AppDatabase) {
                             val lastKnown = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
                             if (lastKnown != null) {
                                 val currentLatLng = LatLng(lastKnown.latitude, lastKnown.longitude)
-                                mapLibreMap?.clear()
-                                mapLibreMap?.addMarker(MarkerOptions().position(currentLatLng).title("Last Known"))
                                 val position = CameraPosition.Builder().target(currentLatLng).zoom(16.0).tilt(0.0).build()
                                 mapLibreMap?.animateCamera(CameraUpdateFactory.newCameraPosition(position), 1500)
-                            } else {
-                                Toast.makeText(context, "No location found.", Toast.LENGTH_SHORT).show()
                             }
                         }
                     }
