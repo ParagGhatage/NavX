@@ -93,6 +93,14 @@ class MainActivity : ComponentActivity() {
             MapLibreScreen(database)
         }
     }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Stop GPS tracking when app closes
+        val intent = Intent(this, TrackingService::class.java)
+        stopService(intent)
+        android.util.Log.d("NavX", "App closed - GPS service stopped")
+    }
 }
 
 @Composable
@@ -255,8 +263,16 @@ fun MapLibreScreen(database: AppDatabase) {
                             .build()
                         map.cameraPosition = defaultPosition
 
-                        map.setStyle("https://demotiles.maplibre.org/style.json") { style ->
-                            android.util.Log.d("NavX", "Map style loaded")
+                        try {
+                            map.setStyle("asset://offline-style.json") { style ->
+                                android.util.Log.d("NavX", "Offline map style loaded")
+                            }
+                        } catch (e: Exception) {
+                            android.util.Log.e("NavX", "Error loading offline style: ${e.message}")
+                            // Fallback to online if offline fails
+                            map.setStyle("https://demotiles.maplibre.org/style.json") { style ->
+                                android.util.Log.d("NavX", "Fallback to online map")
+                            }
                         }
                     }
                 }

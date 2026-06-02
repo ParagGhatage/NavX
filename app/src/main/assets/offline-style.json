@@ -1,13 +1,59 @@
 {
   "version": 8,
-  "name": "NavX Basic Offline Style",
-  "sources": {},
+  "name": "NavX Offline Map",
+  "sources": {
+    "offline-tiles": {
+      "type": "vector",
+      "url": "mbtiles://offline-map"
+    }
+  },
   "layers": [
     {
       "id": "background",
       "type": "background",
       "paint": {
-        "background-color": "#e0e0e0"
+        "background-color": "#ffffff"
+      }
+    },
+    {
+      "id": "water",
+      "type": "fill",
+      "source": "offline-tiles",
+      "source-layer": "water",
+      "paint": {
+        "fill-color": "#a8d5ff"
+      }
+    },
+    {
+      "id": "landuse",
+      "type": "fill",
+      "source": "offline-tiles",
+      "source-layer": "landuse",
+      "paint": {
+        "fill-color": "#e8e8e0"
+      }
+    },
+    {
+      "id": "roads",
+      "type": "line",
+      "source": "offline-tiles",
+      "source-layer": "roads",
+      "paint": {
+        "line-color": "#cccccc",
+        "line-width": 1
+      }
+    },
+    {
+      "id": "labels",
+      "type": "symbol",
+      "source": "offline-tiles",
+      "source-layer": "places",
+      "layout": {
+        "text-field": ["get", "name"],
+        "text-size": 12
+      },
+      "paint": {
+        "text-color": "#000000"
       }
     }
   ]
